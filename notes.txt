@@ -1,0 +1,13 @@
+*** this is a *scratch* buffer which won't be automatically saved ***
+*** use it for notes or open a file buffer with the :edit command ***
+
+-42.3 db in EQ -> 0.006-ish vol
+-36.1 db in EQ -> 0.0118 vol
+-30.3 db in EQ -> 0.023 vol
+-26.3 db in EQ -> 0.0377 vol
+-24.3 db in EQ -> 0.0473 vol
+
+So +6 db change led to ~2x (1.95) volume increase
+Then +6 db led to ~2x (2.05) volume increase again
+
+OK so somehow it's 6db for a 2x volume multiplier
