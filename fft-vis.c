@@ -8,7 +8,7 @@
 
 #define SAMPLE_RATE		48000
 // How many samples will be stored. So this is 0.5 seconds worth
-#define BUFFER_SIZE		SAMPLE_RATE / 2
+#define BUFFER_SIZE		SAMPLE_RATE
 
 // Ports
 #define PORT_COUNT		2
@@ -19,20 +19,22 @@
 typedef struct {
 	unsigned long sampleRate;
 
-	// We might want more samples than we get at a time, or do an FFT across the sample chunks passed to 
-	// runFFTVis. So we store a backlog.
-	float buffer[BUFFER_SIZE];
-	int buffer_start_idx;
-	int buffer_end_idx;
+	// We take an average over a longer time period than each sample chunk.
+	// This an array of BUFFER_SIZE pointers to arrays matching the FFT size.
+	float *buffer[BUFFER_SIZE];
+	int buffer_idx;			// Next address in buffer to write to
 
 	// FFT stuff
 	fftwf_plan fft_plan;
+	float* fft_input;
 	fftwf_complex* fft_output;
 	int fft_size;			// We'll have to re-create the FFT if the sample chunk size changes,
 					// so we better keep track of the current size
 
 	LADSPA_Data *input_buffer;
 	LADSPA_Data *output_buffer;	// Dummy output to make jack-rack happy
+
+	LADSPA_Data *last_input_buffer;
 } FFTVis;
 
 // handle new instance
@@ -44,8 +46,14 @@ static LADSPA_Handle instantiateFFTVis(const LADSPA_Descriptor *descriptor, unsi
 
 	fft_vis->sampleRate = sampleRate;
 	fft_vis->fft_plan = NULL;
+	fft_vis->fft_input = NULL;
 	fft_vis->fft_output = NULL;
 	fft_vis->fft_size = -1;
+
+	fft_vis->buffer_idx = 0;
+	for (int i = 0; i < BUFFER_SIZE; i++) fft_vis->buffer[i] = NULL;
+
+	fft_vis->last_input_buffer = NULL;
 
 	return fft_vis;
 }
@@ -76,16 +84,28 @@ static void runFFTVis(LADSPA_Handle handle, unsigned long sampleCount) {
 	// Maybe re-create fft_plan / output buffer
 	if (fft_vis->fft_size != sampleCount) {
 		if (fft_vis->fft_plan != NULL) fftwf_destroy_plan(fft_vis->fft_plan);
+		if (fft_vis->fft_input != NULL) fftwf_free(fft_vis->fft_input);
 		if (fft_vis->fft_output != NULL) fftwf_free(fft_vis->fft_output);
 
+		fft_vis->fft_input = (float *) fftwf_alloc_complex(sizeof(float) * sampleCount);
 		fft_vis->fft_output = (fftwf_complex*) fftwf_alloc_complex(sizeof(fftwf_complex) * sampleCount);
 		fft_vis->fft_plan = fftwf_plan_dft_r2c_1d(sampleCount,
-			fft_vis->input_buffer, fft_vis->fft_output, FFTW_ESTIMATE);
+			fft_vis->fft_input, fft_vis->fft_output, FFTW_ESTIMATE);
+
+		/*
+		for (int i = 0; i < BUFFER_SIZE; i++) {
+			if (fft_vis->buffer[i] != NULL) free(fft_vis->buffer[i]);
+			fft_vis->buffer[i] = calloc(sampleCount, sizeof(float));
+		}
+		*/
+
+		fft_vis->fft_size = sampleCount;
 	}
 
 	printf("sampleCount: %lu\n", sampleCount);
 
-	// Fill input
+	// Fill input and execute
+	memcpy(fft_vis->fft_input, fft_vis->input_buffer, sizeof(float) * sampleCount);
 	fftwf_execute(fft_vis->fft_plan);
 
 	// Print output
@@ -97,6 +117,7 @@ static void runFFTVis(LADSPA_Handle handle, unsigned long sampleCount) {
 	double factor = pow((double) frequency_count, 1.0 / 256);
 	double start_idx = 1;
 	double end_idx = factor;
+	double total_amplitude = 0;
 	while ((int) end_idx < frequency_count - 1) {
 		// Compute an average over this set of bins
 		double amplitude_sum = 0;
@@ -111,6 +132,8 @@ static void runFFTVis(LADSPA_Handle handle, unsigned long sampleCount) {
 
 		float average_amplitude = amplitude_sum / count;
 
+		total_amplitude += amplitude_sum;
+
 		int char_count = average_amplitude / 0.15 * 300;
 		for (int j = 0; j < char_count; j++) printf("#");
 		printf("\n");
@@ -118,6 +141,8 @@ static void runFFTVis(LADSPA_Handle handle, unsigned long sampleCount) {
 		start_idx *= factor;
 		end_idx *= factor;
 	}
+
+	fft_vis->last_input_buffer = fft_vis->input_buffer;
 }
 
 // free the handle
