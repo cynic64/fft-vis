@@ -1,14 +1,21 @@
+/*
+ * TODO: instead of summing over the entire array every time, store the last sum, subtract the oldest element, add
+ * the newest element
+ */
 #include <stdlib.h>
 #include <string.h>
 #include <ladspa.h>
 #include <stdio.h>
 #include <math.h>
+#include <assert.h>
 
 #include <fftw3.h>
 
 #define SAMPLE_RATE		48000
-// How many samples will be stored. So this is 0.5 seconds worth
-#define BUFFER_SIZE		SAMPLE_RATE
+// How many sample chunks will be stored. Sample chunk size is 2048 for me
+#define BUFFER_SIZE		320
+// How many bars in the visualizer there are
+#define BAR_COUNT		200
 
 // Ports
 #define PORT_COUNT		2
@@ -21,7 +28,7 @@ typedef struct {
 
 	// We take an average over a longer time period than each sample chunk.
 	// This an array of BUFFER_SIZE pointers to arrays matching the FFT size.
-	float *buffer[BUFFER_SIZE];
+	fftwf_complex *buffer[BUFFER_SIZE];
 	int buffer_idx;			// Next address in buffer to write to
 
 	// FFT stuff
@@ -33,8 +40,6 @@ typedef struct {
 
 	LADSPA_Data *input_buffer;
 	LADSPA_Data *output_buffer;	// Dummy output to make jack-rack happy
-
-	LADSPA_Data *last_input_buffer;
 } FFTVis;
 
 // handle new instance
@@ -52,8 +57,6 @@ static LADSPA_Handle instantiateFFTVis(const LADSPA_Descriptor *descriptor, unsi
 
 	fft_vis->buffer_idx = 0;
 	for (int i = 0; i < BUFFER_SIZE; i++) fft_vis->buffer[i] = NULL;
-
-	fft_vis->last_input_buffer = NULL;
 
 	return fft_vis;
 }
@@ -83,6 +86,7 @@ static void runFFTVis(LADSPA_Handle handle, unsigned long sampleCount) {
 
 	// Maybe re-create fft_plan / output buffer
 	if (fft_vis->fft_size != sampleCount) {
+		printf("Re-creating...\n");
 		if (fft_vis->fft_plan != NULL) fftwf_destroy_plan(fft_vis->fft_plan);
 		if (fft_vis->fft_input != NULL) fftwf_free(fft_vis->fft_input);
 		if (fft_vis->fft_output != NULL) fftwf_free(fft_vis->fft_output);
@@ -92,12 +96,10 @@ static void runFFTVis(LADSPA_Handle handle, unsigned long sampleCount) {
 		fft_vis->fft_plan = fftwf_plan_dft_r2c_1d(sampleCount,
 			fft_vis->fft_input, fft_vis->fft_output, FFTW_ESTIMATE);
 
-		/*
 		for (int i = 0; i < BUFFER_SIZE; i++) {
 			if (fft_vis->buffer[i] != NULL) free(fft_vis->buffer[i]);
-			fft_vis->buffer[i] = calloc(sampleCount, sizeof(float));
+			fft_vis->buffer[i] = calloc(sampleCount, sizeof(fftwf_complex));
 		}
-		*/
 
 		fft_vis->fft_size = sampleCount;
 	}
@@ -108,41 +110,61 @@ static void runFFTVis(LADSPA_Handle handle, unsigned long sampleCount) {
 	memcpy(fft_vis->fft_input, fft_vis->input_buffer, sizeof(float) * sampleCount);
 	fftwf_execute(fft_vis->fft_plan);
 
+	// Copy output to long-term buffer
+	memcpy(fft_vis->buffer[fft_vis->buffer_idx], fft_vis->fft_output, sizeof(fftwf_complex) * sampleCount);
+	printf("%d %d\n", fft_vis->buffer_idx, (fft_vis->buffer_idx + 1) % BUFFER_SIZE);
+	fft_vis->buffer_idx = (fft_vis->buffer_idx + 1) % BUFFER_SIZE;
+	printf("%d\n", fft_vis->buffer_idx);
+
 	// Print output
 	// There are too many bars to print indivually, so instead we average chunks of them. The size of each
 	// chunk should grow logarithmically, since frequency is logarithmic in the sense that doubling frequency
 	// means a note one octave higher.
-	int bar_count = 200;
 	int frequency_count = sampleCount / 2;
-	double factor = pow((double) frequency_count, 1.0 / 256);
-	double start_idx = 1;
-	double end_idx = factor;
-	double total_amplitude = 0;
-	while ((int) end_idx < frequency_count - 1) {
-		// Compute an average over this set of bins
-		double amplitude_sum = 0;
-		int count = 0;
-		for (int i = start_idx; i < end_idx; i++) {
-			// Square complex number
-			float real = fft_vis->fft_output[i][0], imag = fft_vis->fft_output[i][1];
-			float amplitude = sqrt(real * real + imag * imag) / sampleCount;
-			amplitude_sum += amplitude;
-			count++;
+	double factor = pow((double) frequency_count, 1.0 / BAR_COUNT);
+	float bar_amplitude_sums[BAR_COUNT] = {0};
+
+	// For each FFT output in fft_vis->buffer...
+	for (int i = 0; i < BUFFER_SIZE; i++) {
+		double start_idx = 1;
+		double end_idx = factor;
+		int bar_amplitude_idx = 0;
+
+		// For every bar...
+		while ((int) end_idx < frequency_count - 1) {
+			// Compute an average over this chunk of bins
+			double amplitude_sum = 0;
+			int count = 0;
+
+			for (int j = start_idx; j < end_idx; j++) {
+				// Square complex number
+				float real = fft_vis->buffer[i][j][0], imag = fft_vis->buffer[i][j][1];
+				float amplitude = sqrt(real * real + imag * imag) / sampleCount;
+				amplitude_sum += amplitude;
+				count++;
+			}
+
+			float average_amplitude = amplitude_sum / count;
+
+			assert(bar_amplitude_idx < BAR_COUNT);
+			bar_amplitude_sums[bar_amplitude_idx++] += average_amplitude;
+
+			start_idx *= factor;
+			end_idx *= factor;
 		}
+	}
 
-		float average_amplitude = amplitude_sum / count;
-
-		total_amplitude += amplitude_sum;
+	// Actually print the bars
+	printf("---\n");
+	for (int i = 0; i < BAR_COUNT; i++) {
+		float average_amplitude = bar_amplitude_sums[i] / BUFFER_SIZE;
+		//printf("%10.5f\n", average_amplitude);
 
 		int char_count = average_amplitude / 0.15 * 300;
 		for (int j = 0; j < char_count; j++) printf("#");
 		printf("\n");
-
-		start_idx *= factor;
-		end_idx *= factor;
 	}
-
-	fft_vis->last_input_buffer = fft_vis->input_buffer;
+	printf("---\n");
 }
 
 // free the handle
